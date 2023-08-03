@@ -9,17 +9,16 @@ use hyper::{
     upgrade::Upgraded, Body, Client, Method, Request, Response, StatusCode, Uri,
 };
 use std::{convert::Infallible, future::Future, net::SocketAddr, sync::Arc};
+use hyper_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
     net::TcpStream,
     task::JoinHandle,
 };
 use tokio_rustls::TlsAcceptor;
-use tokio_tungstenite::{
-    tungstenite::{self, Message},
-    Connector, WebSocketStream,
-};
+use tokio_tungstenite::{tungstenite::{self, Message}, Connector, WebSocketStream, MaybeTlsStream};
 use tracing::{error, info_span, instrument, warn, Instrument, Span};
+use tracing::log::debug;
 
 fn bad_request() -> Response<Body> {
     Response::builder()
@@ -100,7 +99,8 @@ where
         if req.method() == Method::CONNECT {
             Ok(self.process_connect(req))
         } else if hyper_tungstenite::is_upgrade_request(&req) {
-            Ok(self.upgrade_websocket(req))
+            let upgrade_result = self.upgrade_websocket(req).await;
+            Ok(upgrade_result)
         } else {
             let res = self
                 .client
@@ -221,7 +221,7 @@ where
     }
 
     #[instrument(skip_all)]
-    fn upgrade_websocket(self, req: Request<Body>) -> Response<Body> {
+    async fn upgrade_websocket(self, req: Request<Body>) -> Response<Body> {
         let mut req = {
             let (mut parts, _) = req.into_parts();
 
@@ -244,25 +244,54 @@ where
 
             Request::from_parts(parts, ())
         };
-
-        match hyper_tungstenite::upgrade(&mut req, None) {
-            Ok((res, websocket)) => {
+        let mut config = WebSocketConfig::default();
+        config.read_as_frames = true;
+        // 2. Upgrade the connection using the negotiated response received by the proxy client
+        match hyper_tungstenite::upgrade(&mut req, Some(config)) {
+            Ok((_, websocket)) => {
+                // Ignore the fabricated response returned by hyper_tungstenite. We don't
+                // know what the server is going to accept in the negotiation, so use the
+                // response collected from the client connection above.
+                #[cfg(not(any(feature = "rustls-client", feature = "native-tls-client")))]
+                let client_fut = tokio_tungstenite::connect_async(req);
+                let uri = req.uri().clone();
+                // 1. Connect to the server using the client's original request, awaiting the
+                //    negotiated response.
+                #[cfg(any(feature = "rustls-client", feature = "native-tls-client"))]
+                let client_fut = tokio_tungstenite::connect_async_tls_with_config(
+                    req,
+                    Some(config.clone()),
+                    false,
+                    self.websocket_connector.clone(),
+                );
+                let Ok((mut client_socket, resp)) =
+                    client_fut.await
+                else {
+                    return bad_request()
+                };
                 let span = info_span!("websocket");
                 let fut = async move {
                     match websocket.await {
                         Ok(ws) => {
-                            if let Err(e) = self.handle_websocket(ws, req).await {
+                            if let Err(e) =
+                                self.handle_websocket(ws, client_socket, uri).await {
                                 error!("Failed to handle WebSocket: {}", e);
                             }
                         }
                         Err(e) => {
                             error!("Failed to upgrade to WebSocket: {}", e);
+                            if let Err(e) = client_socket
+                                .close(None)
+                                .await {
+                                    error!("Could not close client socket after failed websocket upgrade: {}", e)
+                            }
                         }
                     }
                 };
 
                 spawn_with_trace(fut, span);
-                res
+                let parts = resp.into_parts();
+                Response::from_parts(parts.0, parts.1.map_or(Body::empty(), |b| Body::from(b)))
             }
             Err(_) => bad_request(),
         }
@@ -272,21 +301,9 @@ where
     async fn handle_websocket(
         self,
         server_socket: WebSocketStream<Upgraded>,
-        req: Request<()>,
+        client_socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        uri: Uri
     ) -> Result<(), tungstenite::Error> {
-        let uri = req.uri().clone();
-
-        #[cfg(any(feature = "rustls-client", feature = "native-tls-client"))]
-        let (client_socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-            req,
-            None,
-            false,
-            self.websocket_connector,
-        )
-        .await?;
-
-        #[cfg(not(any(feature = "rustls-client", feature = "native-tls-client")))]
-        let (client_socket, _) = tokio_tungstenite::connect_async(req).await?;
 
         let (server_sink, server_stream) = server_socket.split();
         let (client_sink, client_stream) = client_socket.split();
